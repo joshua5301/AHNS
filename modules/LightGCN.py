@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -88,6 +89,11 @@ class LightGCN(nn.Module):
         self.p = args_config.p
         self.alpha = args_config.alpha
         self.beta = args_config.beta
+
+        self.cur_epoch = -1
+        self.difficulty = np.full(self.n_users, 1.0)
+        self.sigma = np.full(self.n_users, 0.01)
+        self.top_p = np.full(self.n_users, 0.002)
 
         self.device = torch.device("cuda:0") if args_config.cuda else torch.device("cpu")
 
@@ -180,6 +186,15 @@ class LightGCN(nn.Module):
                                                                 pos_item,
                                                                 cur_epoch))
             neg_gcn_embs = torch.stack(neg_gcn_embs, dim=1)
+        elif self.ns == 'signs':
+            neg_gcn_embs = []
+            for k in range(self.K):
+                neg_gcn_embs.append(self.sigma_negative_sampling(user_gcn_emb, item_gcn_emb,
+                                                                 user,
+                                                                 neg_item[:, k * self.n_negs: (k + 1) * self.n_negs],
+                                                                 pos_item,
+                                                                 cur_epoch))
+            neg_gcn_embs = torch.stack(neg_gcn_embs, dim=1)
         else: # ahns
             neg_gcn_embs = []
             for k in range(self.K):
@@ -210,6 +225,48 @@ class LightGCN(nn.Module):
         neg_item = torch.gather(neg_candidates, dim=1, index=indices.unsqueeze(-1)).squeeze()
         
         return item_gcn_emb[neg_item]
+
+    def sigma_negative_sampling(self, user_gcn_emb, item_gcn_emb, user, neg_candidates, pos_item, cur_epoch):
+        
+        if cur_epoch > self.cur_epoch:
+            self.cur_epoch = cur_epoch
+            all_s_e = user_gcn_emb.mean(dim=1)  # [n_users, channel]
+            all_p_e = item_gcn_emb.mean(dim=1)  # [n_items, channel]
+            all_scores = all_s_e @ all_p_e.t()  # [n_users, n_items]
+            all_scores = all_scores.detach().cpu().numpy()
+
+            mask = self.adj_mat.toarray()[:self.n_users, self.n_users:].astype(bool)
+            all_scores[mask] = 0
+            probs = all_scores / all_scores.sum(axis=1, keepdims=True)
+            self.sigma = 1 / np.std(probs, axis=1)
+
+            self.difficulty = np.log(self.sigma)/3 - 1
+            print(np.median(self.difficulty))
+            print(max(self.difficulty), min(self.difficulty))
+            # self.difficulty = np.full(self.n_users, 1.0)
+            self.difficulty = torch.from_numpy(self.difficulty).to(self.device)
+
+
+        batch_size = user.shape[0]
+        s_e, p_e = user_gcn_emb[user], item_gcn_emb[pos_item]  # [batch_size, n_hops+1, channel]
+        difficulty = self.difficulty[user].unsqueeze(1)  # [batch_size, 1]
+        n_e = item_gcn_emb[neg_candidates]  # [batch_size, n_negs, n_hops+1, channel]
+        
+        s_e = s_e.mean(dim=1)  # [batch_size, channel]
+        p_e = p_e.mean(dim=1)  # [batch_size, channel]
+        n_e = n_e.mean(dim=2)  # [batch_size, n_negs, channel]
+                
+        p_scores = self.similarity(s_e, p_e).unsqueeze(dim=1) # [batch_size, 1]
+        n_scores = self.similarity(s_e.unsqueeze(dim=1), n_e) # [batch_size, n_negs]
+
+        scores = torch.abs(n_scores - difficulty)
+
+        """sigma negative sampling"""
+        indices = torch.min(scores, dim=1)[1].detach()  # [batch_size]
+        neg_item = torch.gather(neg_candidates, dim=1, index=indices.unsqueeze(-1)).squeeze()
+
+        return item_gcn_emb[neg_item]
+
         
     def dynamic_negative_sampling(self, user_gcn_emb, item_gcn_emb, user, neg_candidates, pos_item):
         s_e, p_e = user_gcn_emb[user], item_gcn_emb[pos_item]  # [batch_size, n_hops+1, channel]

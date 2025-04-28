@@ -114,7 +114,7 @@ if __name__ == '__main__':
 
         train_e_t = time()
 
-        if epoch % 5 == 0:
+        if epoch % 1 == 0:
             """testing"""
 
             train_res = PrettyTable()
